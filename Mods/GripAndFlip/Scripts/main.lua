@@ -1,19 +1,16 @@
--- Grip & Flip v16 (STAGE 1 multiplayer) - 3-axis rotation for held objects
+-- Grip & Flip v16.1 (Stage 1, performance pass) - 3-axis rotation for held objects
 --
--- Roles (auto-detected, same file on every machine):
---  * HOST / singleplayer: applies rotation offsets per-player to held objects,
---    every frame, composed onto the game's yaw-only phys-handle target from a
---    hook on ABP_HeldenPlayer:BlueprintUpdateAnimation (after character tick,
---    before physics). Also decodes rotation commands arriving from clients.
---  * CLIENT (joined someone's lobby): does not rotate anything locally. Instead
---    encodes rotation input as out-of-range values in the game's own yaw RPC
---    (PhysGrabRotate_Server) - the host's hook decodes them, zeroes the fake
---    yaw, and applies the rotation authoritatively. Stage 1 = "blind" rotation:
---    the client sees the result on drop/place (the game replicates held items
---    yaw-only); the host sees it live.
+-- HOST/singleplayer: applies per-player rotation offsets to held objects each
+-- frame (ABP update hook - after character tick, before physics) and decodes
+-- client commands arriving via the game's own yaw RPC.
+-- CLIENT: encodes rotation input into PhysGrabRotate_Server magic values,
+-- batched to ~20Hz to avoid flooding the connection. Sees results on drop/place.
 --
--- Encoding: v = axisCode*1e6 + deltaDegrees*10   (axis 1=pitch 2=roll 3=yaw,
--- 4=reset). Native yaw values are ~|1-3|, so |v| > 5e5 marks a command.
+-- v16.1 fixes severe frame lag from v16: the per-frame hook now uses cached
+-- player/controller references and address-only identity checks, so the idle
+-- path makes ZERO engine calls per frame per character. v16 did full object
+-- array scans per character per frame (cost scaled with visible characters -
+-- hence "less lag in tight corners").
 --
 -- Controls while holding: Left Alt + mouse = rotate (camera frozen), arrows =
 -- hold/tap, Numpad 8/2/4/6 = 15-degree steps, Numpad 5 = reset, F7 = debug.
@@ -25,16 +22,21 @@ local NUM_STEP = 15.0
 local ROT_RATE = 100.0
 local MOUSE_SENS = 0.8
 local MAGIC_MIN = 5e5
+local SEND_INTERVAL = 0.05 -- client -> host batch window (seconds)
 
 local KEYFILE = os.getenv("TEMP") .. "\\GripAndFlip_keys.txt"
 
 local S = {
-    rotMode = false,   -- Left Alt held (local player, while holding an item)
+    rotMode = false,
     errCount = 0,
     modeLogged = false,
     setParamWarned = false,
 }
-local P = {} -- host only: pawnAddress -> { off = {Pitch,Yaw,Roll}, held = fullname }
+local P = {} -- host: pawnAddress -> { off = {Pitch,Yaw,Roll}, held = targetAddress }
+local B = { pitch = 0, roll = 0, yaw = 0, last = 0, reset = false } -- client send buffer
+
+-- cached references: refreshed on spawn / when invalid, never per-frame
+local C = { pc = nil, pawn = nil, animAddr = nil, isAuth = true, lastTry = 0, ml = nil }
 
 local Hooked = false
 local EnsureHook
@@ -43,18 +45,11 @@ local function Log(msg)
     print("[GripAndFlip] " .. msg .. "\n")
 end
 
-local function GetMathLib()
+local function GetML()
+    if C.ml and C.ml:IsValid() then return C.ml end
     local ml = StaticFindObject("/Script/Engine.Default__KismetMathLibrary")
-    if ml and ml:IsValid() then return ml end
+    if ml and ml:IsValid() then C.ml = ml return ml end
     return nil
-end
-
-local function GetPlayerAndPawn()
-    local pc = UEHelpers.GetPlayerController()
-    if not pc or not pc:IsValid() then return nil, nil end
-    local pawn = pc.Pawn
-    if not pawn or not pawn:IsValid() then return nil, nil end
-    return pc, pawn
 end
 
 local function GetHeld(pawn)
@@ -64,7 +59,7 @@ local function GetHeld(pawn)
     return nil
 end
 
-local function IsAuthority(pawn)
+local function ReadRole(pawn)
     local role = 3
     pcall(function()
         local r = pawn.Role
@@ -74,7 +69,29 @@ local function IsAuthority(pawn)
             if okR and type(n) == "number" then role = n end
         end
     end)
-    return role == 3
+    return role
+end
+
+local function RefreshCache()
+    C.pc, C.pawn, C.animAddr = nil, nil, nil
+    local ok = pcall(function()
+        local pc = UEHelpers.GetPlayerController()
+        if not pc or not pc:IsValid() then return end
+        local pawn = pc.Pawn
+        if not pawn or not pawn:IsValid() then return end
+        C.pc = pc
+        C.pawn = pawn
+        C.animAddr = pawn.Mesh.AnimScriptInstance:GetAddress()
+        C.isAuth = (ReadRole(pawn) == 3)
+    end)
+    if C.animAddr then
+        Log("player cache ready (authority=" .. tostring(C.isAuth) .. ")")
+    end
+    return C.animAddr ~= nil
+end
+
+local function CacheValid()
+    return C.animAddr and C.pc and C.pc:IsValid() and C.pawn and C.pawn:IsValid()
 end
 
 local function ReadKeyMask()
@@ -89,7 +106,6 @@ local function IsIdentity(o)
     return math.abs(o.Pitch) < 0.01 and math.abs(o.Yaw) < 0.01 and math.abs(o.Roll) < 0.01
 end
 
--- world axis for a rotation mode, relative to a view yaw (degrees)
 local function AxisFor(axisMode, yawDeg)
     if axisMode == "yaw" then return { X = 0, Y = 0, Z = 1 } end
     local cyaw = math.rad(yawDeg)
@@ -113,56 +129,72 @@ local AXIS_CODE = { pitch = 1, roll = 2, yaw = 3 }
 
 local function EnsureEntry(pawn, target)
     local addr = pawn:GetAddress()
-    local tname = target:GetFullName()
+    local taddr = target:GetAddress()
     local e = P[addr]
-    if not e or e.held ~= tname then
-        e = { off = { Pitch = 0, Yaw = 0, Roll = 0 }, held = tname }
+    if not e or e.held ~= taddr then
+        e = { off = { Pitch = 0, Yaw = 0, Roll = 0 }, held = taddr }
         P[addr] = e
     end
     return e
 end
 
--- local input funnel: host applies, client transmits
+-- local input funnel: host composes immediately, client buffers for batch send
 local function ApplyInput(pc, pawn, axisMode, deltaDeg)
     local target = GetHeld(pawn)
     if not target then return end
-    if IsAuthority(pawn) then
-        local ml = GetMathLib()
+    if C.isAuth then
+        local ml = GetML()
         if not ml then return end
         local camRot = pc.PlayerCameraManager:GetCameraRotation()
         ComposeInto(EnsureEntry(pawn, target), ml, camRot.Yaw, axisMode, deltaDeg)
     else
         if not S.modeLogged then
             S.modeLogged = true
-            Log("client mode: sending rotation to host (host must run Grip & Flip v16+). You'll see results when you drop/place the item.")
+            Log("client mode: batching rotation to host (host must run Grip & Flip v16+)")
         end
-        local d = math.max(-90, math.min(90, deltaDeg))
-        pawn:PhysGrabRotate_Server(AXIS_CODE[axisMode] * 1e6 + d * 10)
+        B[axisMode] = math.max(-90, math.min(90, B[axisMode] + deltaDeg))
     end
 end
 
-local function ResetTilt(pc, pawn)
+local function FlushSendBuffer(pawn)
+    local now = os.clock()
+    if now - B.last < SEND_INTERVAL then return end
+    B.last = now
+    if B.reset then
+        B.reset = false
+        B.pitch, B.roll, B.yaw = 0, 0, 0
+        pcall(function() pawn:PhysGrabRotate_Server(4 * 1e6) end)
+        return
+    end
+    for axis, code in pairs(AXIS_CODE) do
+        local d = B[axis]
+        if math.abs(d) > 0.01 then
+            B[axis] = 0
+            pcall(function() pawn:PhysGrabRotate_Server(code * 1e6 + d * 10) end)
+        end
+    end
+end
+
+local function ResetTilt()
     if S.rotMode then
         S.rotMode = false
-        if pc and pc:IsValid() then pcall(function() pc:ResetIgnoreLookInput() end) end
+        if C.pc and C.pc:IsValid() then pcall(function() C.pc:ResetIgnoreLookInput() end) end
     end
-    if not pawn then return end
-    if IsAuthority(pawn) then
-        P[pawn:GetAddress()] = nil
+    if not CacheValid() then return end
+    if C.isAuth then
+        P[C.pawn:GetAddress()] = nil
     else
-        pcall(function() pawn:PhysGrabRotate_Server(4 * 1e6) end)
+        B.reset = true
     end
 end
 
--- keybind taps
 local function Tap(axisMode, dir, step)
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
-            local pc, pawn = GetPlayerAndPawn()
-            if not pawn then return end
-            if not GetHeld(pawn) then Log("skip: not holding") return end
+            if not CacheValid() and not RefreshCache() then return end
+            if not GetHeld(C.pawn) then Log("skip: not holding") return end
             if not EnsureHook() then return end
-            ApplyInput(pc, pawn, axisMode, step * dir)
+            ApplyInput(C.pc, C.pawn, axisMode, step * dir)
         end)
         if not ok then Log("ERROR: " .. tostring(err)) end
     end)
@@ -179,30 +211,38 @@ RegisterKeyBind(Key.NUM_SIX, function() Tap("roll", -1, NUM_STEP) end)
 RegisterKeyBind(Key.NUM_FIVE, function()
     ExecuteInGameThread(function()
         pcall(function()
-            local pc, pawn = GetPlayerAndPawn()
-            ResetTilt(pc, pawn)
+            ResetTilt()
             S.errCount = 0
         end)
     end)
 end)
 
--- per-frame hook: local input capture (all machines) + application (host only)
+-- per-frame hook. Idle cost: one GetAddress + one or two pure-Lua checks.
 local function TryRegisterHook()
     RegisterHook("/Game/Animation/ABP_HeldenPlayer.ABP_HeldenPlayer_C:BlueprintUpdateAnimation",
         function(self, DeltaTimeX)
             if S.errCount >= 8 then return end
             local ok, err = pcall(function()
-                local inst = self:get()
-                local pawn = inst:TryGetPawnOwner()
-                if not pawn or not pawn:IsValid() then return end
+                local a = self:get():GetAddress()
 
-                local pc, localPawn = GetPlayerAndPawn()
-                local isLocal = localPawn and pawn:GetAddress() == localPawn:GetAddress()
+                if not C.animAddr then
+                    -- cache not built yet; try at most once a second
+                    local now = os.clock()
+                    if now - C.lastTry < 1.0 then return end
+                    C.lastTry = now
+                    if not RefreshCache() then return end
+                end
 
-                -- ===== local input capture (host and client alike) =====
-                if isLocal then
-                    local mask = ReadKeyMask()
+                if a == C.animAddr then
+                    -- ===== local player: input capture =====
+                    if not CacheValid() then
+                        C.animAddr = nil -- pawn died / respawned; rebuild next second
+                        return
+                    end
+                    local pc, pawn = C.pc, C.pawn
                     local target = GetHeld(pawn)
+                    local mask = 0
+                    if target or S.rotMode then mask = ReadKeyMask() end
                     local rHeld = target ~= nil and (mask & 16) ~= 0
 
                     if rHeld ~= S.rotMode then
@@ -211,7 +251,7 @@ local function TryRegisterHook()
                         else pc:ResetIgnoreLookInput() end
                     end
 
-                    if target then
+                    if target and mask ~= 0 then
                         local dt = DeltaTimeX:get()
                         local step = ROT_RATE * dt
                         if (mask & 1) ~= 0 then ApplyInput(pc, pawn, "pitch", step) end
@@ -227,42 +267,64 @@ local function TryRegisterHook()
                             if type(dy) == "number" and dy ~= 0 then ApplyInput(pc, pawn, "pitch", dy * MOUSE_SENS) end
                         end
                     end
+
+                    if not C.isAuth then
+                        FlushSendBuffer(pawn)
+                        return
+                    end
+                    -- host: fall through to apply own entry via shared path below
+                    local e = P[pawn:GetAddress()]
+                    if not e then return end
+                    local tgt = target
+                    if not tgt or tgt:GetAddress() ~= e.held then P[pawn:GetAddress()] = nil return end
+                    if IsIdentity(e.off) then return end
+                    local ml = GetML()
+                    if not ml then return end
+                    local handle = pawn.GrabPhysHandle
+                    if not handle or not handle:IsValid() then return end
+                    local outLoc, outRot = {}, {}
+                    handle:GetTargetLocationAndRotation(outLoc, outRot)
+                    local o = e.off
+                    local final = ml:ComposeRotators(
+                        { Pitch = outRot.Pitch, Yaw = outRot.Yaw, Roll = outRot.Roll },
+                        { Pitch = o.Pitch, Yaw = o.Yaw, Roll = o.Roll })
+                    handle:SetTargetLocationAndRotation(
+                        { X = outLoc.X, Y = outLoc.Y, Z = outLoc.Z },
+                        { Pitch = final.Pitch, Yaw = final.Yaw, Roll = final.Roll })
+                    return
                 end
 
-                -- ===== application: host machine only, any player's pawn =====
-                if IsAuthority(pawn) then
-                    local addr = pawn:GetAddress()
-                    local e = P[addr]
-                    if e then
-                        local target = GetHeld(pawn)
-                        if not target or target:GetFullName() ~= e.held then
-                            P[addr] = nil
-                            return
-                        end
-                        if IsIdentity(e.off) then return end
-                        local ml = GetMathLib()
-                        if not ml then return end
-                        local handle = pawn.GrabPhysHandle
-                        if not handle or not handle:IsValid() then return end
-                        local outLoc, outRot = {}, {}
-                        handle:GetTargetLocationAndRotation(outLoc, outRot)
-                        local o = e.off
-                        local final = ml:ComposeRotators(
-                            { Pitch = outRot.Pitch, Yaw = outRot.Yaw, Roll = outRot.Roll },
-                            { Pitch = o.Pitch, Yaw = o.Yaw, Roll = o.Roll })
-                        handle:SetTargetLocationAndRotation(
-                            { X = outLoc.X, Y = outLoc.Y, Z = outLoc.Z },
-                            { Pitch = final.Pitch, Yaw = final.Yaw, Roll = final.Roll })
-                    end
-                end
+                -- ===== other characters: only matters on host with active entries =====
+                if next(P) == nil then return end
+                local inst = self:get()
+                local pawn = inst:TryGetPawnOwner()
+                if not pawn or not pawn:IsValid() then return end
+                local addr = pawn:GetAddress()
+                local e = P[addr]
+                if not e then return end
+                local target = GetHeld(pawn)
+                if not target or target:GetAddress() ~= e.held then P[addr] = nil return end
+                if IsIdentity(e.off) then return end
+                local ml = GetML()
+                if not ml then return end
+                local handle = pawn.GrabPhysHandle
+                if not handle or not handle:IsValid() then return end
+                local outLoc, outRot = {}, {}
+                handle:GetTargetLocationAndRotation(outLoc, outRot)
+                local o = e.off
+                local final = ml:ComposeRotators(
+                    { Pitch = outRot.Pitch, Yaw = outRot.Yaw, Roll = outRot.Roll },
+                    { Pitch = o.Pitch, Yaw = o.Yaw, Roll = o.Roll })
+                handle:SetTargetLocationAndRotation(
+                    { X = outLoc.X, Y = outLoc.Y, Z = outLoc.Z },
+                    { Pitch = final.Pitch, Yaw = final.Yaw, Roll = final.Roll })
             end)
             if not ok then
                 S.errCount = S.errCount + 1
                 Log("frame ERROR (" .. S.errCount .. "/8): " .. tostring(err))
                 if S.errCount >= 8 then
                     pcall(function()
-                        local pc = UEHelpers.GetPlayerController()
-                        if pc and pc:IsValid() then pc:ResetIgnoreLookInput() end
+                        if C.pc and C.pc:IsValid() then C.pc:ResetIgnoreLookInput() end
                     end)
                     S.rotMode = false
                     Log("too many errors - Grip & Flip disabled, Ctrl+R to retry")
@@ -288,18 +350,19 @@ EnsureHook()
 pcall(function()
     RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self)
         EnsureHook()
+        C.animAddr = nil -- respawn/level change: rebuild cache on next frame
+        C.lastTry = 0
     end)
 end)
 
--- host-side decoder: rotation commands from clients arrive as out-of-range
--- values in the game's own yaw RPC; decode, apply, neutralize the fake yaw
+-- host-side decoder for client rotation commands
 pcall(function()
     RegisterHook("/Script/Helden.HeldenCharacter:PhysGrabRotate_Server", function(self, InRight)
         pcall(function()
             local v = InRight:get()
-            if math.abs(v) < MAGIC_MIN then return end -- normal Q/E traffic
+            if math.abs(v) < MAGIC_MIN then return end
             local pawn = self:get()
-            if not IsAuthority(pawn) then return end   -- client send-side: pass through untouched
+            if ReadRole(pawn) ~= 3 then return end -- client send-side: pass through
             local axisCode = math.floor(v / 1e6 + 0.5)
             local deltaDeg = (v - axisCode * 1e6) / 10
 
@@ -309,7 +372,7 @@ pcall(function()
                 local axisMode = (axisCode == 1 and "pitch") or (axisCode == 2 and "roll") or "yaw"
                 local target = GetHeld(pawn)
                 if target then
-                    local ml = GetMathLib()
+                    local ml = GetML()
                     if ml then
                         local viewYaw = 0
                         pcall(function() viewYaw = pawn:GetControlRotation().Yaw end)
@@ -318,7 +381,6 @@ pcall(function()
                 end
             end
 
-            -- neutralize the fake yaw so the native handler does nothing
             local okSet = pcall(function() InRight:set(0.0) end)
             if not okSet and not S.setParamWarned then
                 S.setParamWarned = true
@@ -328,7 +390,7 @@ pcall(function()
     end)
 end)
 
--- key poller (physical Alt/arrow state; engine-side key polling crashes this build)
+-- key poller
 local function FindPoller()
     local candidates = {
         "Mods\\GripAndFlip\\keypoll.ps1",
@@ -355,15 +417,14 @@ end
 RegisterKeyBind(Key.F7, function()
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
-            local pc, pawn = GetPlayerAndPawn()
-            if not pawn then Log("F7: no pawn") return end
-            local target = GetHeld(pawn)
+            if not CacheValid() and not RefreshCache() then Log("F7: no player") return end
+            local target = GetHeld(C.pawn)
             Log("Holding: " .. (target and target:GetFullName() or "nothing"))
-            Log("Authority: " .. tostring(IsAuthority(pawn)) .. " errs: " .. S.errCount)
+            Log("Authority: " .. tostring(C.isAuth) .. " errs: " .. S.errCount)
             local n = 0
             for addr, e in pairs(P) do
                 n = n + 1
-                Log(string.format("  entry %d: P%.1f Y%.1f R%.1f held=%s", n, e.off.Pitch, e.off.Yaw, e.off.Roll, e.held))
+                Log(string.format("  entry %d: P%.1f Y%.1f R%.1f", n, e.off.Pitch, e.off.Yaw, e.off.Roll))
             end
             if n == 0 then Log("  no active rotation entries") end
         end)
@@ -371,4 +432,4 @@ RegisterKeyBind(Key.F7, function()
     end)
 end)
 
-Log("v16 STAGE1 loaded. Host applies for all players; clients transmit via RPC. Alt+mouse / arrows / numpad as before.")
+Log("v16.1 STAGE1 loaded (perf pass). Alt+mouse / arrows / numpad as before, Num5 = reset, F7 = debug.")
