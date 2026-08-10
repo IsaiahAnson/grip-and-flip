@@ -1,4 +1,4 @@
-﻿-- GripAndFlip v12 - stable core + toggle-glide continuous rotation
+-- GripAndFlip v12 - stable core + toggle-glide continuous rotation
 --
 -- Architecture (final, everything here is crash-proven in v10/v11 sessions):
 --  * Native tick writes the phys-handle target yaw-only every frame (auto-upright).
