@@ -44,8 +44,11 @@ Releasing or re-grabbing an object cleanly returns it to vanilla behavior.
 
 - Friends **do not** need the mod to play with you — nothing in the game files is
   modified, so modded and unmodded players join each other freely.
-- Works best **when you host**. As a joining client the server may fight your
-  rotation (untested territory).
+- **Rotation only works when you are the HOST** (or in singleplayer). The host's
+  machine owns held-object physics; as a joining client your rotation would just
+  fight the server's corrections, so the mod detects this and disables itself
+  with a console message. If everyone in your group wants to grip and flip,
+  take turns hosting.
 - While you carry a tilted item, other players see it upright (the game replicates
   held rotation yaw-only). The moment you drop or place it, everyone sees the true
   orientation.

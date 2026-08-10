@@ -139,6 +139,26 @@ end
 
 local function Engage(pawn)
     if S.engaged then return true end
+    -- multiplayer: the HOST's machine owns held-object physics. As a joining
+    -- client our local rotation just fights the server's yaw-only corrections
+    -- (rigid/glitchy snap-back), so bow out cleanly instead.
+    -- Role: 3 = Authority (host or singleplayer), 2 = AutonomousProxy (client)
+    local role = 3
+    pcall(function()
+        local r = pawn.Role
+        if type(r) == "number" then role = r
+        elseif type(r) == "userdata" then
+            local okR, n = pcall(function() return r:get() end)
+            if okR and type(n) == "number" then role = n end
+        end
+    end)
+    if role ~= 3 then
+        if not S.mpWarned then
+            S.mpWarned = true
+            Log("Multiplayer client detected - Grip & Flip only works when you are the HOST (or in singleplayer). Rotation disabled for this session.")
+        end
+        return false
+    end
     local ok = pcall(function()
         S.animAddr = pawn.Mesh.AnimScriptInstance:GetAddress()
     end)
