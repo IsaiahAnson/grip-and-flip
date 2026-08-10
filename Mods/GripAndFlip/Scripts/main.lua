@@ -305,6 +305,16 @@ end
 
 EnsureHook() -- works immediately when (re)loading while already in-game
 
+-- On a fresh boot the ABP class isn't loaded yet, so the hook can't register
+-- until we're in a level. ClientRestart fires whenever the local player spawns
+-- (native engine function - registrable at boot), so use it to finish setup.
+-- Without this, Alt/hold rotation needed an arrow press or Ctrl+R to wake up.
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self)
+        EnsureHook()
+    end)
+end)
+
 -- launch the key poller (singleton; exits itself when the game closes)
 local pollerPath = FindPoller()
 if pollerPath then
