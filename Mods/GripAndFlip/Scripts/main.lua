@@ -1,4 +1,10 @@
--- Grip & Flip v16.1 (Stage 1, performance pass) - 3-axis rotation for held objects
+-- Grip & Flip v16.2 (remote smoothing) - 3-axis rotation for held objects
+--
+-- v16.2: client-driven rotations are no longer applied as instant 50ms steps
+-- on the host. The RPC decoder now writes to a target offset and the host
+-- interpolates the applied offset toward it each frame (RInterpTo), so the
+-- replicated transform follows a smooth curve instead of a 20Hz staircase.
+-- Fixes the jitter remote players saw on their own held items.
 --
 -- HOST/singleplayer: applies per-player rotation offsets to held objects each
 -- frame (ABP update hook - after character tick, before physics) and decodes
@@ -23,6 +29,7 @@ local ROT_RATE = 100.0
 local MOUSE_SENS = 0.8
 local MAGIC_MIN = 5e5
 local SEND_INTERVAL = 0.05 -- client -> host batch window (seconds)
+local SMOOTH_SPEED = 12.0 -- host-side interp speed for client-driven rotation (deg-space exponential)
 
 local KEYFILE = os.getenv("TEMP") .. "\\GripAndFlip_keys.txt"
 
@@ -116,13 +123,13 @@ local function AxisFor(axisMode, yawDeg)
     end
 end
 
-local function ComposeInto(entry, ml, yawDeg, axisMode, deltaDeg)
+local function ComposeInto(entry, field, ml, yawDeg, axisMode, deltaDeg)
     local delta = ml:RotatorFromAxisAndAngle(AxisFor(axisMode, yawDeg), deltaDeg)
-    local o = entry.off
+    local o = entry[field]
     local n = ml:ComposeRotators(
         { Pitch = o.Pitch, Yaw = o.Yaw, Roll = o.Roll },
         { Pitch = delta.Pitch, Yaw = delta.Yaw, Roll = delta.Roll })
-    entry.off = { Pitch = n.Pitch, Yaw = n.Yaw, Roll = n.Roll }
+    entry[field] = { Pitch = n.Pitch, Yaw = n.Yaw, Roll = n.Roll }
 end
 
 local AXIS_CODE = { pitch = 1, roll = 2, yaw = 3 }
@@ -132,7 +139,11 @@ local function EnsureEntry(pawn, target)
     local taddr = target:GetAddress()
     local e = P[addr]
     if not e or e.held ~= taddr then
-        e = { off = { Pitch = 0, Yaw = 0, Roll = 0 }, held = taddr }
+        e = {
+            off = { Pitch = 0, Yaw = 0, Roll = 0 },
+            tgt = { Pitch = 0, Yaw = 0, Roll = 0 },
+            held = taddr,
+        }
         P[addr] = e
     end
     return e
@@ -146,7 +157,11 @@ local function ApplyInput(pc, pawn, axisMode, deltaDeg)
         local ml = GetML()
         if not ml then return end
         local camRot = pc.PlayerCameraManager:GetCameraRotation()
-        ComposeInto(EnsureEntry(pawn, target), ml, camRot.Yaw, axisMode, deltaDeg)
+        local e = EnsureEntry(pawn, target)
+        -- own input: apply directly (off) and keep tgt in lockstep so the
+        -- smoothing path never fights it
+        ComposeInto(e, "off", ml, camRot.Yaw, axisMode, deltaDeg)
+        e.tgt = { Pitch = e.off.Pitch, Yaw = e.off.Yaw, Roll = e.off.Roll }
     else
         if not S.modeLogged then
             S.modeLogged = true
@@ -304,9 +319,16 @@ local function TryRegisterHook()
                 if not e then return end
                 local target = GetHeld(pawn)
                 if not target or target:GetAddress() ~= e.held then P[addr] = nil return end
-                if IsIdentity(e.off) then return end
+                if IsIdentity(e.off) and IsIdentity(e.tgt) then return end
                 local ml = GetML()
                 if not ml then return end
+                -- smooth the applied offset toward the client's target so the
+                -- replicated transform moves on a curve, not a 20Hz staircase
+                local sm = ml:RInterpTo(
+                    { Pitch = e.off.Pitch, Yaw = e.off.Yaw, Roll = e.off.Roll },
+                    { Pitch = e.tgt.Pitch, Yaw = e.tgt.Yaw, Roll = e.tgt.Roll },
+                    DeltaTimeX:get(), SMOOTH_SPEED)
+                e.off = { Pitch = sm.Pitch, Yaw = sm.Yaw, Roll = sm.Roll }
                 local handle = pawn.GrabPhysHandle
                 if not handle or not handle:IsValid() then return end
                 local outLoc, outRot = {}, {}
@@ -376,7 +398,9 @@ pcall(function()
                     if ml then
                         local viewYaw = 0
                         pcall(function() viewYaw = pawn:GetControlRotation().Yaw end)
-                        ComposeInto(EnsureEntry(pawn, target), ml, viewYaw, axisMode, deltaDeg)
+                        -- client-driven: compose into the TARGET only; the frame
+                        -- hook interpolates the applied offset toward it
+                        ComposeInto(EnsureEntry(pawn, target), "tgt", ml, viewYaw, axisMode, deltaDeg)
                     end
                 end
             end
@@ -432,4 +456,4 @@ RegisterKeyBind(Key.F7, function()
     end)
 end)
 
-Log("v16.1 STAGE1 loaded (perf pass). Alt+mouse / arrows / numpad as before, Num5 = reset, F7 = debug.")
+Log("v16.2 loaded (remote smoothing). Alt+mouse / arrows / numpad as before, Num5 = reset, F7 = debug.")
