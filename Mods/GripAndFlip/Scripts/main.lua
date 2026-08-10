@@ -1,10 +1,11 @@
--- Grip & Flip v16.2 (remote smoothing) - 3-axis rotation for held objects
+-- Grip & Flip v17 (client-side prediction) - 3-axis rotation for held objects
 --
--- v16.2: client-driven rotations are no longer applied as instant 50ms steps
--- on the host. The RPC decoder now writes to a target offset and the host
--- interpolates the applied offset toward it each frame (RInterpTo), so the
--- replicated transform follows a smooth curve instead of a 20Hz staircase.
--- Fixes the jitter remote players saw on their own held items.
+-- v17: clients now apply their rotation offset to their OWN local phys handle
+-- every frame, mirroring what the host applies. Previously the client's local
+-- grab sim kept forcing the item upright (the game's yaw-only auto-upright)
+-- while host corrections replicated back tilted - the two fought every net
+-- update, which is the jitter remote players saw on their own held items.
+-- With matching local prediction the corrections are near-zero.
 --
 -- HOST/singleplayer: applies per-player rotation offsets to held objects each
 -- frame (ABP update hook - after character tick, before physics) and decodes
@@ -29,7 +30,7 @@ local ROT_RATE = 100.0
 local MOUSE_SENS = 0.8
 local MAGIC_MIN = 5e5
 local SEND_INTERVAL = 0.05 -- client -> host batch window (seconds)
-local SMOOTH_SPEED = 12.0 -- host-side interp speed for client-driven rotation (deg-space exponential)
+local SMOOTH_SPEED = 25.0 -- host-side interp speed for client-driven rotation (light smoothing only)
 
 local KEYFILE = os.getenv("TEMP") .. "\\GripAndFlip_keys.txt"
 
@@ -149,6 +150,33 @@ local function EnsureEntry(pawn, target)
     return e
 end
 
+-- shared per-frame apply: (optionally) smooth off toward tgt, then re-compose
+-- the phys handle target rotation with the offset. Safe on both host and
+-- client - the handle validity guard covers pawns with no local handle.
+local function ApplyEntryToHandle(pawn, e, dt, smooth)
+    if IsIdentity(e.off) and IsIdentity(e.tgt) then return end
+    local ml = GetML()
+    if not ml then return end
+    if smooth then
+        local sm = ml:RInterpTo(
+            { Pitch = e.off.Pitch, Yaw = e.off.Yaw, Roll = e.off.Roll },
+            { Pitch = e.tgt.Pitch, Yaw = e.tgt.Yaw, Roll = e.tgt.Roll },
+            dt, SMOOTH_SPEED)
+        e.off = { Pitch = sm.Pitch, Yaw = sm.Yaw, Roll = sm.Roll }
+    end
+    local handle = pawn.GrabPhysHandle
+    if not handle or not handle:IsValid() then return end
+    local outLoc, outRot = {}, {}
+    handle:GetTargetLocationAndRotation(outLoc, outRot)
+    local o = e.off
+    local final = ml:ComposeRotators(
+        { Pitch = outRot.Pitch, Yaw = outRot.Yaw, Roll = outRot.Roll },
+        { Pitch = o.Pitch, Yaw = o.Yaw, Roll = o.Roll })
+    handle:SetTargetLocationAndRotation(
+        { X = outLoc.X, Y = outLoc.Y, Z = outLoc.Z },
+        { Pitch = final.Pitch, Yaw = final.Yaw, Roll = final.Roll })
+end
+
 -- local input funnel: host composes immediately, client buffers for batch send
 local function ApplyInput(pc, pawn, axisMode, deltaDeg)
     local target = GetHeld(pawn)
@@ -168,6 +196,15 @@ local function ApplyInput(pc, pawn, axisMode, deltaDeg)
             Log("client mode: batching rotation to host (host must run Grip & Flip v16+)")
         end
         B[axisMode] = math.max(-90, math.min(90, B[axisMode] + deltaDeg))
+        -- local prediction: mirror the offset on our own phys handle so the
+        -- local sim agrees with what the host replicates back (kills jitter)
+        local ml = GetML()
+        if ml then
+            local camRot = pc.PlayerCameraManager:GetCameraRotation()
+            local e = EnsureEntry(pawn, target)
+            ComposeInto(e, "off", ml, camRot.Yaw, axisMode, deltaDeg)
+            e.tgt = { Pitch = e.off.Pitch, Yaw = e.off.Yaw, Roll = e.off.Roll }
+        end
     end
 end
 
@@ -196,9 +233,8 @@ local function ResetTilt()
         if C.pc and C.pc:IsValid() then pcall(function() C.pc:ResetIgnoreLookInput() end) end
     end
     if not CacheValid() then return end
-    if C.isAuth then
-        P[C.pawn:GetAddress()] = nil
-    else
+    P[C.pawn:GetAddress()] = nil -- clear local entry on both host and client
+    if not C.isAuth then
         B.reset = true
     end
 end
@@ -285,27 +321,15 @@ local function TryRegisterHook()
 
                     if not C.isAuth then
                         FlushSendBuffer(pawn)
-                        return
                     end
-                    -- host: fall through to apply own entry via shared path below
+                    -- host AND client: apply own entry to own (local) handle
                     local e = P[pawn:GetAddress()]
                     if not e then return end
-                    local tgt = target
-                    if not tgt or tgt:GetAddress() ~= e.held then P[pawn:GetAddress()] = nil return end
-                    if IsIdentity(e.off) then return end
-                    local ml = GetML()
-                    if not ml then return end
-                    local handle = pawn.GrabPhysHandle
-                    if not handle or not handle:IsValid() then return end
-                    local outLoc, outRot = {}, {}
-                    handle:GetTargetLocationAndRotation(outLoc, outRot)
-                    local o = e.off
-                    local final = ml:ComposeRotators(
-                        { Pitch = outRot.Pitch, Yaw = outRot.Yaw, Roll = outRot.Roll },
-                        { Pitch = o.Pitch, Yaw = o.Yaw, Roll = o.Roll })
-                    handle:SetTargetLocationAndRotation(
-                        { X = outLoc.X, Y = outLoc.Y, Z = outLoc.Z },
-                        { Pitch = final.Pitch, Yaw = final.Yaw, Roll = final.Roll })
+                    if not target or target:GetAddress() ~= e.held then
+                        P[pawn:GetAddress()] = nil
+                        return
+                    end
+                    ApplyEntryToHandle(pawn, e, DeltaTimeX:get(), false)
                     return
                 end
 
@@ -319,27 +343,7 @@ local function TryRegisterHook()
                 if not e then return end
                 local target = GetHeld(pawn)
                 if not target or target:GetAddress() ~= e.held then P[addr] = nil return end
-                if IsIdentity(e.off) and IsIdentity(e.tgt) then return end
-                local ml = GetML()
-                if not ml then return end
-                -- smooth the applied offset toward the client's target so the
-                -- replicated transform moves on a curve, not a 20Hz staircase
-                local sm = ml:RInterpTo(
-                    { Pitch = e.off.Pitch, Yaw = e.off.Yaw, Roll = e.off.Roll },
-                    { Pitch = e.tgt.Pitch, Yaw = e.tgt.Yaw, Roll = e.tgt.Roll },
-                    DeltaTimeX:get(), SMOOTH_SPEED)
-                e.off = { Pitch = sm.Pitch, Yaw = sm.Yaw, Roll = sm.Roll }
-                local handle = pawn.GrabPhysHandle
-                if not handle or not handle:IsValid() then return end
-                local outLoc, outRot = {}, {}
-                handle:GetTargetLocationAndRotation(outLoc, outRot)
-                local o = e.off
-                local final = ml:ComposeRotators(
-                    { Pitch = outRot.Pitch, Yaw = outRot.Yaw, Roll = outRot.Roll },
-                    { Pitch = o.Pitch, Yaw = o.Yaw, Roll = o.Roll })
-                handle:SetTargetLocationAndRotation(
-                    { X = outLoc.X, Y = outLoc.Y, Z = outLoc.Z },
-                    { Pitch = final.Pitch, Yaw = final.Yaw, Roll = final.Roll })
+                ApplyEntryToHandle(pawn, e, DeltaTimeX:get(), true)
             end)
             if not ok then
                 S.errCount = S.errCount + 1
@@ -456,4 +460,4 @@ RegisterKeyBind(Key.F7, function()
     end)
 end)
 
-Log("v16.2 loaded (remote smoothing). Alt+mouse / arrows / numpad as before, Num5 = reset, F7 = debug.")
+Log("v17 loaded (client prediction). Alt+mouse / arrows / numpad as before, Num5 = reset, F7 = debug.")
