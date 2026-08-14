@@ -444,10 +444,30 @@ end
 
 local pollerPath = FindPoller()
 if pollerPath then
-    local okExec = pcall(function()
-        os.execute('start "" /min powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' .. pollerPath .. '"')
+    -- Under unreal-shimloader the mod folder is a VIRTUAL path that only the
+    -- game process can resolve; PowerShell is a separate process and cannot
+    -- open it. Copy the script to the real %TEMP% from in-process (where the
+    -- virtual read works) and launch the copy. Also correct for manual installs.
+    local launchPath = pollerPath
+    pcall(function()
+        local tmp = os.getenv("TEMP")
+        if not tmp then return end
+        local src = io.open(pollerPath, "r")
+        if not src then return end
+        local body = src:read("*a")
+        src:close()
+        if not body or #body == 0 then return end
+        local dstPath = tmp .. "\\GrabRotate3D_keypoll.ps1"
+        local dst = io.open(dstPath, "w")
+        if not dst then return end
+        dst:write(body)
+        dst:close()
+        launchPath = dstPath
     end)
-    Log(okExec and "key poller launched" or "WARNING: could not launch key poller - hold/Alt rotation unavailable")
+    local okExec = pcall(function()
+        os.execute('start "" /min powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' .. launchPath .. '"')
+    end)
+    Log(okExec and ("key poller launched: " .. launchPath) or "WARNING: could not launch key poller - hold/Alt rotation unavailable")
 else
     Log("WARNING: keypoll.ps1 not found - hold/Alt rotation unavailable (taps still work)")
 end
