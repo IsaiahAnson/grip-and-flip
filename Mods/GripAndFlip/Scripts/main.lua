@@ -425,6 +425,16 @@ local function FindPoller()
         "ue4ss\\Mods\\GripAndFlip\\keypoll.ps1",
         "..\\ue4ss\\Mods\\GripAndFlip\\keypoll.ps1",
     }
+    -- resolve relative to this script file first: required under
+    -- unreal-shimloader (Thunderstore/r2modman), where the mod folder lives
+    -- in a profile directory instead of the game folder
+    pcall(function()
+        local src = debug.getinfo(1, "S").source
+        local dir = src:match("^@(.*)[\\/]Scripts[\\/]main%.lua$")
+        if dir then
+            table.insert(candidates, 1, dir .. "\\keypoll.ps1")
+        end
+    end)
     for _, p in ipairs(candidates) do
         local f = io.open(p, "r")
         if f then f:close() return p end

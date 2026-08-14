@@ -34,11 +34,8 @@ Releasing or re-grabbing an object cleanly returns it to vanilla behavior.
    **This step is required** — stock UE4SS cannot find three engine functions in
    Grain Rot's UE 5.7 build and will fail to start without these signatures.
 3. Copy this repo's `Mods\GripAndFlip` folder into `Win64\ue4ss\Mods\`.
-4. Open `Win64\ue4ss\Mods\mods.txt` and add this line above the `Keybinds` entry:
-   ```
-   GripAndFlip : 1
-   ```
-5. Launch the game. You should see `[GripAndFlip] v15 loaded` in the UE4SS console/log.
+   The included `enabled.txt` activates the mod — no `mods.txt` editing needed.
+4. Launch the game. You should see `[GripAndFlip] v17 loaded` in the UE4SS console/log.
 
 ## Multiplayer
 
