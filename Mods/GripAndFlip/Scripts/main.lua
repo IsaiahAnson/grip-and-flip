@@ -268,6 +268,23 @@ RegisterKeyBind(Key.NUM_FIVE, function()
     end)
 end)
 
+-- tenkeyless alternatives (player feedback: no numpad on TKL keyboards):
+-- Shift+Arrows = big 15-degree steps, Shift+Backspace = reset
+pcall(function()
+    RegisterKeyBind(Key.UP_ARROW, { ModifierKey.SHIFT }, function() Tap("pitch", 1, NUM_STEP) end)
+    RegisterKeyBind(Key.DOWN_ARROW, { ModifierKey.SHIFT }, function() Tap("pitch", -1, NUM_STEP) end)
+    RegisterKeyBind(Key.LEFT_ARROW, { ModifierKey.SHIFT }, function() Tap("roll", 1, NUM_STEP) end)
+    RegisterKeyBind(Key.RIGHT_ARROW, { ModifierKey.SHIFT }, function() Tap("roll", -1, NUM_STEP) end)
+    RegisterKeyBind(Key.BACKSPACE, { ModifierKey.SHIFT }, function()
+        ExecuteInGameThread(function()
+            pcall(function()
+                ResetTilt()
+                S.errCount = 0
+            end)
+        end)
+    end)
+end)
+
 -- per-frame hook. Idle cost: one GetAddress + one or two pure-Lua checks.
 local function TryRegisterHook()
     RegisterHook("/Game/Animation/ABP_HeldenPlayer.ABP_HeldenPlayer_C:BlueprintUpdateAnimation",

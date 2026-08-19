@@ -14,6 +14,8 @@ painting sideways, stack crates at whatever angle you want.
 | **Arrow keys** | Hold for smooth rotation, tap for a small nudge |
 | **Numpad 8 / 2 / 4 / 6** | Precise 15° steps (pitch / roll) |
 | **Numpad 5** | Reset to vanilla upright |
+| **Shift + Arrow keys** | Precise 15° steps — for keyboards with no numpad |
+| **Shift + Backspace** | Reset to vanilla upright — for keyboards with no numpad |
 | **Q / E** | Native yaw (untouched) |
 
 Releasing or re-grabbing an object cleanly returns it to vanilla behavior.
