@@ -1,8 +1,8 @@
-<img src="icon.png" width="128" align="right" alt="GripAndFlip icon">
-
 # Grip & Flip
 
 [**Get it on Thunderstore**](https://thunderstore.io/c/grain-rot/p/Mentalize/GripAndFlip/)
+
+<img src="icon.png" width="120" align="right" alt="GripAndFlip icon">
 
 **3-axis rotation for held objects in Grain Rot.**
 
