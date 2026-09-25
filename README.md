@@ -83,3 +83,9 @@ UE4SS/UE 5.7 combination. The poller starts with the mod and exits with the game
   [UE4SS-RE/RE-UE4SS#1228](https://github.com/UE4SS-RE/RE-UE4SS/issues/1228)
   (posted by **aslavd**).
 - Built with [RE-UE4SS](https://github.com/UE4SS-RE/RE-UE4SS).
+
+## License
+
+Copyright (c) 2026 Isaiah Anson. All rights reserved. You may use the released software for
+personal, non-commercial use; copying, modifying or redistributing it requires written
+permission. See [LICENSE](LICENSE).
